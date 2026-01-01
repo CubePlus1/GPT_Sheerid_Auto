@@ -29,6 +29,9 @@ except ImportError:
     HAS_REQUESTS_GO = False
     print("[警告] 未安装 requests-go，将使用普通 requests（无 TLS 指纹模拟）")
 
+# 导入 WebhookEmailClient
+from webhook_email_client import WebhookEmailClient
+
 # 配置文件路径
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / 'config.json'
@@ -256,6 +259,77 @@ class CloudMailClient:
         pass
 
 
+class MailpitClient:
+    """Mailpit API 客户端 - 支持本地 Mailpit 邮件测试服务"""
+
+    def __init__(self, config):
+        self.api_url = config.get('api_url', 'http://localhost:8025').rstrip('/')
+        self.email_address = config.get('email_address', '')
+
+    def connect(self):
+        """测试连接"""
+        try:
+            import requests
+            resp = requests.get(f'{self.api_url}/api/v1/messages', timeout=5)
+            return resp.status_code == 200
+        except Exception as e:
+            print(f"[Mailpit] 连接失败: {e}")
+            return False
+
+    def get_latest_emails(self, folder='INBOX', count=5):
+        """获取最新邮件"""
+        try:
+            import requests
+            resp = requests.get(f'{self.api_url}/api/v1/messages', timeout=10)
+            
+            if resp.status_code != 200:
+                return []
+
+            data = resp.json()
+            messages = data.get('messages', [])
+            
+            if not messages:
+                return []
+
+            emails = []
+            # 按时间倒序处理最新邮件
+            for message in sorted(messages, key=lambda x: x.get('Created', ''), reverse=True)[:count]:
+                # 检查是否发送给目标邮箱
+                to_emails = [addr.get('Address', '') for addr in message.get('To', [])]
+                
+                # 如果指定了邮箱地址，检查收件人
+                if self.email_address and self.email_address not in to_emails:
+                    continue
+                
+                # 获取邮件详情
+                msg_id = message.get('ID')
+                detail_resp = requests.get(f'{self.api_url}/api/v1/message/{msg_id}', timeout=10)
+                
+                if detail_resp.status_code != 200:
+                    continue
+                
+                detail = detail_resp.json()
+                subject = detail.get('Subject', '')
+                
+                # 优先使用 HTML，其次使用 Text
+                content = detail.get('HTML', '') or detail.get('Text', '')
+                
+                emails.append({
+                    'subject': subject,
+                    'content': content
+                })
+            
+            return emails
+            
+        except Exception as e:
+            print(f"[Mailpit] 获取邮件失败: {e}")
+            return []
+
+    def close(self):
+        """关闭连接（Mailpit 无需关闭）"""
+        pass
+
+
 def _extract_chrome_version(user_agent):
     """从 UA 中提取 Chrome 版本号"""
     match = re.search(r'Chrome/(\d+)', user_agent)
@@ -346,24 +420,39 @@ def match_branch(input_str):
 def load_random_proxy(proxy_file):
     """随机选择一个代理"""
     if not proxy_file.exists():
+        print(f"[代理] proxy.txt 不存在，将使用直连")
         return None
-    lines = [l.strip() for l in proxy_file.read_text().split('\n') if l.strip() and not l.startswith('#')]
+    
+    try:
+        lines = [l.strip() for l in proxy_file.read_text(encoding='utf-8').split('\n') if l.strip() and not l.startswith('#')]
+    except Exception as e:
+        print(f"[代理] 读取 proxy.txt 失败: {e}")
+        return None
+    
     if not lines:
+        print(f"[代理] proxy.txt 为空，将使用直连")
         return None
+    
     line = random.choice(lines)
 
     # 支持多种格式
     # 格式1: ip:port:user:pass
     # 格式2: ip:port
     # 格式3: socks5://user:pass@ip:port
-    if line.startswith('socks5://') or line.startswith('http://'):
+    # 格式4: http://ip:port 或 https://ip:port
+    if line.startswith(('socks5://', 'http://', 'https://')):
+        print(f"[代理] 使用代理: {line.split('@')[-1] if '@' in line else line.split('//')[1]}")
         return {'url': line}
 
     parts = line.split(':')
     if len(parts) == 4:
+        print(f"[代理] 使用代理: {parts[0]}:{parts[1]} (认证)")
         return {'ip': parts[0], 'port': parts[1], 'user': parts[2], 'pass': parts[3]}
     elif len(parts) == 2:
+        print(f"[代理] 使用代理: {parts[0]}:{parts[1]}")
         return {'ip': parts[0], 'port': parts[1], 'user': None, 'pass': None}
+    
+    print(f"[代理] 格式错误: {line}")
     return None
 
 
@@ -376,8 +465,10 @@ def get_proxy_dict(proxy):
         return {'http': proxy['url'], 'https': proxy['url']}
 
     if proxy.get('user') and proxy.get('pass'):
+        # 有认证信息，默认使用 SOCKS5
         proxy_url = f"socks5://{proxy['user']}:{proxy['pass']}@{proxy['ip']}:{proxy['port']}"
     else:
+        # 无认证，使用 HTTP 代理
         proxy_url = f"http://{proxy['ip']}:{proxy['port']}"
     return {'http': proxy_url, 'https': proxy_url}
 
@@ -495,15 +586,45 @@ def create_session(proxy_dict, tls_profile):
     return session
 
 
+def sanitize_headers(headers):
+    """清理 headers，确保所有值都是 ASCII 兼容的"""
+    sanitized = {}
+    for key, value in headers.items():
+        if isinstance(value, str):
+            # 尝试编码为 ASCII，如果失败则使用 latin-1
+            try:
+                # 先尝试 ASCII
+                value.encode('ascii')
+            except UnicodeEncodeError:
+                # 如果包含非 ASCII 字符，尝试 latin-1
+                try:
+                    value.encode('latin-1')
+                except UnicodeEncodeError:
+                    # 如果 latin-1 也不行，使用 utf-8 再转为 latin-1
+                    value = value.encode('utf-8').decode('utf-8', errors='ignore')
+        sanitized[key] = value
+    return sanitized
+
+
 def extract_verification_link(content):
     """从邮件内容提取验证链接"""
+    import html
+    
+    # 尝试从 href 属性提取
     match = re.search(r'href="(https://services\.sheerid\.com/verify/[^"]+emailToken=[^"]+)"', content)
     if match:
-        return match.group(1).replace('&amp;', '&')
+        link = match.group(1)
+        # 解码 HTML 实体 (&amp; -> &, &quot; -> ", etc.)
+        link = html.unescape(link)
+        return link
 
+    # 尝试直接匹配 URL
     match = re.search(r'https://services\.sheerid\.com/verify/[^\s<>"]+emailToken=\d+', content)
     if match:
-        return match.group(0)
+        link = match.group(0)
+        # 解码 HTML 实体
+        link = html.unescape(link)
+        return link
 
     return None
 
@@ -544,14 +665,114 @@ def create_verification(session, access_token, program_id, context, user_agent):
 
     resp = session.post(
         'https://chatgpt.com/backend-api/veterans/create_verification',
-        headers=headers,
+        headers=sanitize_headers(headers),
         json={'program_id': program_id}
     )
 
     if resp.status_code != 200:
+        print(f"    -> 创建验证失败: status={resp.status_code}, response={resp.text[:200]}")
         raise Exception(f"创建 verification 失败: {resp.status_code}")
+    
+    result = resp.json()
+    verification_id = result.get('verification_id')
+    
+    # 检查是否返回了新的 ID
+    if not verification_id:
+        print(f"    -> 警告: 未获取到 verificationId")
+        print(f"    -> 响应内容: {result}")
+        raise Exception("未获取到 verification_id")
+    
+    print(f"    -> 创建成功: verificationId={verification_id}")
+    print(f"    -> 验证 URL: https://services.sheerid.com/verify/{program_id}/?verificationId={verification_id}")
+    
+    # 输出完整响应供调试
+    if 'error' in result or 'message' in result:
+        print(f"    -> API 响应: {result}")
+    
+    return verification_id
 
-    return resp.json().get('verification_id')
+
+def get_verification_status(session, verification_id, program_id, user_agent):
+    """获取验证当前状态"""
+    chrome_ver = _extract_chrome_version(user_agent)
+    nr_headers = generate_newrelic_headers()
+    referer_url = f'https://services.sheerid.com/verify/{program_id}/?verificationId={verification_id}'
+
+    headers = {
+        'host': 'services.sheerid.com',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-ch-ua': f'"Chromium";v="{chrome_ver}", "Google Chrome";v="{chrome_ver}", "Not_A Brand";v="99"',
+        'clientversion': '2.157.0',
+        'newrelic': nr_headers['newrelic'],
+        'sec-ch-ua-mobile': '?0',
+        'traceparent': nr_headers['traceparent'],
+        'clientname': 'jslib',
+        'user-agent': user_agent,
+        'accept': 'application/json',
+        'tracestate': nr_headers['tracestate'],
+        'origin': 'https://services.sheerid.com',
+        'sec-fetch-site': 'same-origin',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty',
+        'referer': referer_url,
+        'accept-encoding': 'gzip, deflate, br, zstd',
+        'accept-language': 'en-US,en-GB;q=0.9,en;q=0.8',
+        'priority': 'u=1, i',
+    }
+
+    resp = session.get(
+        f'https://services.sheerid.com/rest/v2/verification/{verification_id}',
+        headers=sanitize_headers(headers)
+    )
+
+    if resp.status_code == 200:
+        data = resp.json()
+        current_step = data.get('currentStep', 'unknown')
+        current_state = data.get('currentState', 'unknown')
+        print(f"    -> 当前状态: currentStep={current_step}, currentState={current_state}")
+        return data
+    else:
+        print(f"    -> 获取状态失败: status={resp.status_code}")
+        return None
+
+
+def get_verification_status(session, verification_id, program_id, user_agent):
+    """获取当前验证状态"""
+    chrome_ver = _extract_chrome_version(user_agent)
+    nr_headers = generate_newrelic_headers()
+
+    headers = {
+        'host': 'services.sheerid.com',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-ch-ua': f'"Chromium";v="{chrome_ver}", "Google Chrome";v="{chrome_ver}", "Not_A Brand";v="99"',
+        'clientversion': '2.157.0',
+        'newrelic': nr_headers['newrelic'],
+        'sec-ch-ua-mobile': '?0',
+        'traceparent': nr_headers['traceparent'],
+        'clientname': 'jslib',
+        'user-agent': user_agent,
+        'accept': 'application/json',
+        'tracestate': nr_headers['tracestate'],
+        'origin': 'https://services.sheerid.com',
+        'sec-fetch-site': 'same-origin',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty',
+        'referer': f'https://services.sheerid.com/verify/{program_id}/?verificationId={verification_id}',
+        'accept-encoding': 'gzip, deflate, br, zstd',
+        'accept-language': 'en-US,en-GB;q=0.9,en;q=0.8',
+        'priority': 'u=1, i',
+    }
+
+    resp = session.get(
+        f'https://services.sheerid.com/rest/v2/verification/{verification_id}',
+        headers=sanitize_headers(headers)
+    )
+
+    if resp.status_code == 200:
+        return resp.json()
+    else:
+        print(f"    -> 获取状态失败: status={resp.status_code}")
+        return None
 
 
 def submit_military_status(session, verification_id, program_id, user_agent):
@@ -584,14 +805,19 @@ def submit_military_status(session, verification_id, program_id, user_agent):
 
     resp = session.post(
         f'https://services.sheerid.com/rest/v2/verification/{verification_id}/step/collectMilitaryStatus',
-        headers=headers,
+        headers=sanitize_headers(headers),
         json={'status': 'VETERAN'}
     )
 
+    data = resp.json()
+    current_step = data.get('currentStep', 'unknown')
+    print(f"    -> 状态提交: currentStep={current_step}, status={resp.status_code}")
+    
     if resp.status_code != 200:
+        print(f"    -> 错误详情: {data}")
         raise Exception(f"提交状态失败: {resp.status_code}")
 
-    return resp.json()
+    return data
 
 
 def submit_personal_info(session, verification_id, program_id, user_data, user_agent, fingerprint_hash):
@@ -655,14 +881,21 @@ def submit_personal_info(session, verification_id, program_id, user_data, user_a
 
     resp = session.post(
         f'https://services.sheerid.com/rest/v2/verification/{verification_id}/step/collectInactiveMilitaryPersonalInfo',
-        headers=headers,
+        headers=sanitize_headers(headers),
         json=payload
     )
 
     data = resp.json()
+    
+    # 打印响应状态供调试
+    current_step = data.get('currentStep', 'unknown')
+    error_ids = data.get('errorIds', [])
+    print(f"    -> 响应: currentStep={current_step}, status={resp.status_code}, errorIds={error_ids}")
 
-    if resp.status_code == 429 or 'verificationLimitExceeded' in str(data.get('errorIds', [])):
+    # 只有明确的 verificationLimitExceeded 错误才标记为已验证
+    if 'verificationLimitExceeded' in error_ids:
         data['_already_verified'] = True
+        print(f"    -> 检测到资料已被验证过")
 
     if resp.status_code not in [200, 429]:
         raise Exception(f"提交个人信息失败: {resp.status_code}")
@@ -701,7 +934,7 @@ def submit_email_token(session, verification_id, program_id, email_token, user_a
 
     resp = session.post(
         f'https://services.sheerid.com/rest/v2/verification/{verification_id}/step/emailLoop',
-        headers=headers,
+        headers=sanitize_headers(headers),
         json={
             'emailToken': email_token,
             'deviceFingerprintHash': fingerprint_hash
@@ -711,6 +944,98 @@ def submit_email_token(session, verification_id, program_id, email_token, user_a
     if resp.status_code == 200:
         return resp.json()
     return None
+
+
+def try_again(session, verification_id, program_id, user_agent, fingerprint_hash):
+    """点击 tryAgain 按钮刷新验证状态（当 not approved 时）"""
+    chrome_ver = _extract_chrome_version(user_agent)
+    nr_headers = generate_newrelic_headers()
+    referer_url = f'https://services.sheerid.com/verify/{program_id}/?verificationId={verification_id}'
+
+    headers = {
+        'host': 'services.sheerid.com',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-ch-ua': f'"Chromium";v="{chrome_ver}", "Google Chrome";v="{chrome_ver}", "Not_A Brand";v="99"',
+        'clientversion': '2.157.0',
+        'newrelic': nr_headers['newrelic'],
+        'sec-ch-ua-mobile': '?0',
+        'traceparent': nr_headers['traceparent'],
+        'clientname': 'jslib',
+        'user-agent': user_agent,
+        'accept': 'application/json',
+        'content-type': 'application/json',
+        'tracestate': nr_headers['tracestate'],
+        'origin': 'https://services.sheerid.com',
+        'sec-fetch-site': 'same-origin',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty',
+        'referer': referer_url,
+        'accept-encoding': 'gzip, deflate, br, zstd',
+        'accept-language': 'en-US,en-GB;q=0.9,en;q=0.8',
+        'priority': 'u=1, i',
+    }
+
+    resp = session.post(
+        f'https://services.sheerid.com/rest/v2/verification/{verification_id}/step/tryAgain',
+        headers=sanitize_headers(headers),
+        json={'deviceFingerprintHash': fingerprint_hash}
+    )
+
+    if resp.status_code == 200:
+        data = resp.json()
+        current_step = data.get('currentStep', 'unknown')
+        current_state = data.get('currentState', 'unknown')
+        print(f"    -> tryAgain 响应: currentStep={current_step}, currentState={current_state}")
+        return data
+    else:
+        print(f"    -> tryAgain 失败: status={resp.status_code}")
+        return None
+
+
+def try_again(session, verification_id, program_id, user_agent, fingerprint_hash):
+    """点击 tryAgain 按钮刷新验证状态（当 not approved 时）"""
+    chrome_ver = _extract_chrome_version(user_agent)
+    nr_headers = generate_newrelic_headers()
+    referer_url = f'https://services.sheerid.com/verify/{program_id}/?verificationId={verification_id}'
+
+    headers = {
+        'host': 'services.sheerid.com',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-ch-ua': f'"Chromium";v="{chrome_ver}", "Google Chrome";v="{chrome_ver}", "Not_A Brand";v="99"',
+        'clientversion': '2.157.0',
+        'newrelic': nr_headers['newrelic'],
+        'sec-ch-ua-mobile': '?0',
+        'traceparent': nr_headers['traceparent'],
+        'clientname': 'jslib',
+        'user-agent': user_agent,
+        'accept': 'application/json',
+        'content-type': 'application/json',
+        'tracestate': nr_headers['tracestate'],
+        'origin': 'https://services.sheerid.com',
+        'sec-fetch-site': 'same-origin',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-dest': 'empty',
+        'referer': referer_url,
+        'accept-encoding': 'gzip, deflate, br, zstd',
+        'accept-language': 'en-US,en-GB;q=0.9,en;q=0.8',
+        'priority': 'u=1, i',
+    }
+
+    resp = session.post(
+        f'https://services.sheerid.com/rest/v2/verification/{verification_id}/step/tryAgain',
+        headers=sanitize_headers(headers),
+        json={'deviceFingerprintHash': fingerprint_hash}
+    )
+
+    if resp.status_code == 200:
+        data = resp.json()
+        current_step = data.get('currentStep', 'unknown')
+        current_state = data.get('currentState', 'unknown')
+        print(f"    -> tryAgain 响应: currentStep={current_step}, currentState={current_state}")
+        return data
+    else:
+        print(f"    -> tryAgain 失败: status={resp.status_code}")
+        return None
 
 
 def verify(access_token, program_id, user_data, email, proxy_dict, tls_profile, email_client):
@@ -738,9 +1063,91 @@ def verify(access_token, program_id, user_data, email, proxy_dict, tls_profile, 
         session.cookies.set('sid-verificationId', verification_id, domain='services.sheerid.com')
         session.cookies.set(f'fingerprint_{fingerprint_timestamp}', f'undefined-{fingerprint_timestamp}', domain='services.sheerid.com')
 
+        # 检查初始状态
+        print(f"    -> 检查初始状态...")
+        status_data = get_verification_status(session, verification_id, program_id, user_agent)
+        
+        if not status_data:
+            # 获取状态失败（可能是 429 或网络问题）
+            print(f"    -> 获取状态失败，稍后重试")
+            return {'success': False, 'message': '获取状态失败', 'retry': True}
+        
+        initial_step = status_data.get('currentStep', '')
+        initial_state = status_data.get('currentState', '')
+        error_ids = status_data.get('errorIds', [])
+        
+        # 定义预期的表单步骤
+        expected_form_steps = ['collectMilitaryStatus', 'collectInactiveMilitaryPersonalInfo', 
+                              'collectActiveMilitaryPersonalInfo', 'collectShortPersonalInfo']
+        
+        # 如果是 error 状态，尝试刷新
+        if initial_step == 'error':
+                # 可以尝试刷新的错误类型
+                refresh_errors = ['notApproved', 'verificationLimitExceeded', 'cantVerify']
+                should_try_refresh = any(err in error_ids for err in refresh_errors)
+                
+                if should_try_refresh:
+                    matched_errors = [err for err in refresh_errors if err in error_ids]
+                    print(f"    -> 检测到错误状态: {', '.join(matched_errors)}")
+                    print(f"    -> 点击 Try Again 按钮刷新...")
+                    
+                    # 尝试刷新状态
+                    refresh_result = try_again(session, verification_id, program_id, user_agent, fingerprint_hash)
+                    
+                    if refresh_result:
+                        refresh_step = refresh_result.get('currentStep', 'error')
+                        
+                        if refresh_step == 'success':
+                            print(f"    -> ✓ 刷新成功，验证已完成")
+                            return {'success': True, 'message': '刷新后验证成功'}
+                        elif refresh_step in expected_form_steps:
+                            print(f"    -> ✓ 刷新成功，继续提交流程")
+                            # 不返回，继续后续提交流程
+                        else:
+                            # 刷新后仍然失败
+                            print(f"    -> ✗ 刷新后状态: {refresh_step}")
+                            return {'success': False, 'message': f"刷新后验证失败: {', '.join(matched_errors)}", 'skip': True}
+                    else:
+                        # tryAgain API 失败（404等），说明需要重新创建验证
+                        print(f"    -> ✗ Try Again 失败 (404)")
+                        print(f"    -> 需要重新创建验证流程")
+                        # 返回 retry 标志，让外层重新创建验证
+                        return {'success': False, 'message': f"需要重新创建验证", 'retry': True}
+                else:
+                    # 其他不支持刷新的错误
+                    return {'success': False, 'message': f"验证错误: {error_ids}"}
+        
+        # 如果已经成功了
+        if initial_step == 'success':
+            return {'success': True, 'message': '验证已完成（无需提交）'}
+        
+        # 如果状态不是预期的表单步骤，重新创建验证
+        if initial_step not in expected_form_steps:
+            print(f"    -> 状态异常: {initial_step}")
+            print(f"    -> 需要正确的表单页面才能提交")
+            print(f"    -> 预期步骤: {', '.join(expected_form_steps)}")
+            return {'success': False, 'message': f"状态异常，重新创建验证", 'retry': True}
+
+        # 状态正确，继续提交
+        print(f"    -> 状态正确: {initial_step}")
+        
         # 提交状态
         print(f"    -> 提交状态...")
-        submit_military_status(session, verification_id, program_id, user_agent)
+        status_result = submit_military_status(session, verification_id, program_id, user_agent)
+        status_step = status_result.get('currentStep')
+        
+        # 检查状态提交后的步骤
+        if status_step == 'error':
+            error_ids = status_result.get('errorIds', [])
+            return {'success': False, 'message': f"状态提交错误: {error_ids}"}
+        
+        if status_step == 'success':
+            return {'success': True, 'message': '验证成功（无需个人信息）'}
+        
+        # 只有在正确的步骤时才提交个人信息
+        expected_steps = ['collectInactiveMilitaryPersonalInfo', 'collectActiveMilitaryPersonalInfo', 'collectShortPersonalInfo']
+        if status_step not in expected_steps:
+            print(f"    -> 警告: 意外的步骤 '{status_step}'，尝试继续提交个人信息...")
 
         # 提交个人信息
         print(f"    -> 提交个人信息...")
@@ -748,9 +1155,7 @@ def verify(access_token, program_id, user_data, email, proxy_dict, tls_profile, 
         result = submit_personal_info(session, verification_id, program_id, user_data, user_agent, fingerprint_hash)
         current_step = result.get('currentStep')
 
-        if result.get('_already_verified'):
-            return {'success': False, 'message': '资料已被验证过', 'skip': True}
-
+        # 优先检查当前步骤，确保 emailLoop 不会被跳过
         if current_step == 'success':
             return {'success': True, 'message': '验证成功'}
 
@@ -761,42 +1166,102 @@ def verify(access_token, program_id, user_data, email, proxy_dict, tls_profile, 
         if current_step == 'docUpload':
             return {'success': False, 'message': '需要上传文档'}
 
-        # emailLoop - 需要邮件验证
+        # emailLoop - 需要邮件验证（优先处理，不受 _already_verified 影响）
         if current_step == 'emailLoop':
-            print(f"    -> 等待验证邮件...")
+            print(f"    -> 等待验证邮件 (verificationId: {verification_id})...")
 
             verification_link = None
-            for retry in range(20):
-                emails = email_client.get_latest_emails(count=5)
+            email_token = None
+            
+            # 优先使用 WebhookEmailClient 的直接获取链接方法
+            if hasattr(email_client, 'get_verification_link'):
+                print(f"    -> 使用 Webhook 直接获取验证链接...")
+                verification_link, email_token = email_client.get_verification_link(timeout=60)
+                
+                # 确认链接包含正确的 verificationId
+                if verification_link and verification_id not in verification_link:
+                    print(f"      警告: 链接的 verificationId 不匹配，继续等待...")
+                    verification_link = None
+                    email_token = None
+            
+            # 如果 webhook 方法失败，或使用其他邮箱方式，使用通用方法
+            if not verification_link:
+                print(f"    -> 使用通用方法获取邮件...")
+                for retry in range(20):
+                    emails = email_client.get_latest_emails(count=5)
 
-                for e in emails:
-                    content = e.get('content', '')
-                    if is_verification_email(content):
-                        link = extract_verification_link(content)
-                        if link and verification_id in link:
-                            verification_link = link
-                            break
+                    for e in emails:
+                        content = e.get('content', '')
+                        if is_verification_email(content):
+                            link = extract_verification_link(content)
+                            if link and verification_id in link:
+                                verification_link = link
+                                break
 
-                if verification_link:
-                    break
+                    if verification_link:
+                        break
 
-                print(f"      等待中... ({retry+1}/20)")
-                time.sleep(3)
+                    print(f"      等待中... ({retry+1}/20)")
+                    time.sleep(3)
 
             if not verification_link:
                 return {'success': False, 'message': '未收到验证邮件'}
 
-            email_token = extract_email_token(verification_link)
+            # 如果还没有 token，从链接提取
+            if not email_token:
+                email_token = extract_email_token(verification_link)
+            
             if not email_token:
                 return {'success': False, 'message': '无法提取 emailToken'}
 
             print(f"    -> 提交邮件验证 (token: {email_token})...")
             result = submit_email_token(session, verification_id, program_id, email_token, user_agent, fingerprint_hash)
 
-            if result and result.get('currentStep') == 'success':
-                return {'success': True, 'message': '验证成功'}
+            if result:
+                current_step = result.get('currentStep')
+                current_state = result.get('currentState', '')
+                
+                # 直接成功
+                if current_step == 'success':
+                    return {'success': True, 'message': '验证成功'}
+                
+                # 检查是否需要重试（pending 或 not approved）
+                if current_state in ['pending', 'notApproved'] or current_step == 'pending':
+                    print(f"    -> 检测到状态: {current_state or current_step}，尝试刷新...")
+                    
+                    # 重试最多 5 次
+                    retry_result = None
+                    for retry in range(5):
+                        time.sleep(3)  # 等待 3 秒
+                        print(f"    -> 刷新状态 ({retry+1}/5)...")
+                        
+                        retry_result = try_again(session, verification_id, program_id, user_agent, fingerprint_hash)
+                        
+                        if retry_result:
+                            retry_step = retry_result.get('currentStep')
+                            retry_state = retry_result.get('currentState', '')
+                            
+                            if retry_step == 'success':
+                                return {'success': True, 'message': '验证成功（刷新后）'}
+                            elif retry_state not in ['pending', 'notApproved'] and retry_step != 'pending':
+                                # 状态改变了，但不是 success
+                                break
+                    
+                    # 重试后再次检查最终状态
+                    if retry_result:
+                        if retry_result.get('currentStep') == 'success':
+                            return {'success': True, 'message': '验证成功'}
+                        else:
+                            return {'success': False, 'message': f"验证失败: {retry_result.get('errorIds', [])}"}
+                
+                # 其他情况
+                return {'success': False, 'message': f"验证失败: {result.get('errorIds', [])}"}
             else:
-                return {'success': False, 'message': f"验证失败: {result.get('errorIds', []) if result else '未知'}"}
+                return {'success': False, 'message': '提交邮件验证失败'}
+
+        # 最后检查是否已验证过（作为兜底逻辑）
+        if result.get('_already_verified'):
+            return {'success': False, 'message': '资料已被验证过', 'skip': True}
 
         return {'success': False, 'message': f"未知状态: {current_step}"}
 
@@ -871,9 +1336,9 @@ def main():
         print('       请登录 chatgpt.com，从开发者工具获取 accessToken')
         return
 
-    # 初始化邮箱（支持 IMAP 和 CloudMail 两种方式）
+    # 初始化邮箱（支持 IMAP、CloudMail、Mailpit 和 Webhook 四种方式）
     email_config = config.get('email', {})
-    email_type = email_config.get('type', 'imap')
+    email_type = email_config.get('type', 'imap').lower()
 
     if email_type == 'cloudmail':
         # CloudMail API 方式
@@ -882,6 +1347,22 @@ def main():
             return
         email_client = CloudMailClient(email_config)
         print(f"[CloudMail] {email_config['email_address']}")
+    elif email_type == 'mailpit':
+        # Mailpit API 方式
+        if not email_config.get('api_url'):
+            print('[错误] Mailpit 配置不完整，请检查 api_url')
+            return
+        email_client = MailpitClient(email_config)
+        email_addr = email_config.get('email_address', 'any@example.com')
+        print(f"[Mailpit] {email_addr} (本地测试邮箱)")
+    elif email_type == 'webhook':
+        # Webhook 方式 - 本地 HTTP 服务接收
+        if not email_config.get('api_url'):
+            print('[错误] Webhook 配置不完整，请检查 api_url')
+            return
+        email_client = WebhookEmailClient(email_config)
+        email_addr = email_config.get('email_address', 'any@example.com')
+        print(f"[Webhook] {email_addr} (HTTP 服务接收)")
     else:
         # IMAP 方式
         if not email_config.get('email_address'):
@@ -919,6 +1400,7 @@ def main():
     skip_count = 0
     total = len(lines)
     i = 0
+    retry_count = {}  # 记录每条数据的重试次数
 
     while i < total:
         line = lines[i]
@@ -933,7 +1415,7 @@ def main():
 
         print(f"\n[{i+1}/{total}] {name} ({branch})")
 
-        # 加载代理和 TLS 指纹
+        # 加载代理和 TLS 指纹（每次都重新加载，避免状态污染）
         proxy = load_random_proxy(PROXY_FILE)
         proxy_dict = get_proxy_dict(proxy)
         tls_profile = load_random_tls_profile(ua_keywords=["Chrome", "Windows"])
@@ -954,9 +1436,42 @@ def main():
             log_result(f"[OK] {name} | {branch}")
             move_to_used(line, '成功')
             remove_from_data(line)
+            retry_count.pop(i, None)  # 清除重试计数
             print()
             print('-' * 50)
             print('  验证成功! 停止运行')
+            print('-' * 50)
+            break
+        elif result.get('retry'):
+            # 需要重新创建验证，重试当前记录
+            current_retry = retry_count.get(i, 0)
+            
+            if current_retry >= 3:
+                # 超过最大重试次数，标记为失败
+                print(f"    [FAIL] 已重试 {current_retry} 次，跳过此记录")
+                fail_count += 1
+                log_result(f"[FAIL] {name} | {branch} | 重试次数超限")
+                move_to_used(line, '失败')
+                remove_from_data(line)
+                retry_count[i] = 0  # 重置计数
+                i += 1
+            else:
+                # 增加重试计数
+                retry_count[i] = current_retry + 1
+                wait_time = 5 + (current_retry * 5)  # 递增等待时间: 5, 10, 15 秒
+                print(f"    [RETRY] 第 {retry_count[i]} 次重试，等待 {wait_time} 秒...")
+                time.sleep(wait_time)
+                # 不增加 i，继续处理当前记录
+        elif result.get('fatal'):
+            # 致命错误（如账号已失效），停止所有处理
+            error_msg = result.get('message', '致命错误')
+            fail_count += 1
+            print(f"    [FATAL] {error_msg}")
+            log_result(f"[FATAL] {name} | {branch} | {error_msg}")
+            print()
+            print('-' * 50)
+            print('  ⚠️  检测到致命错误，停止运行')
+            print('  请更换新的 ChatGPT 账号后重试')
             print('-' * 50)
             break
         elif result.get('skip'):
@@ -965,6 +1480,7 @@ def main():
             log_result(f"[SKIP] {name} | {branch}")
             move_to_used(line, '跳过')
             remove_from_data(line)
+            retry_count.pop(i, None)  # 清除重试计数
             i += 1
         else:
             error_msg = result.get('error') or result.get('message') or '未知错误'
@@ -973,6 +1489,7 @@ def main():
             log_result(f"[FAIL] {name} | {branch} | {error_msg}")
             move_to_used(line, '失败')
             remove_from_data(line)
+            retry_count.pop(i, None)  # 清除重试计数
             i += 1
 
         if i < total:

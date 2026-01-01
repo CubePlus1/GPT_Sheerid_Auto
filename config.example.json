@@ -2,7 +2,7 @@
     "accessToken": "你的ChatGPT accessToken，登录后访问 chatgpt.com/api/auth/session 获取",
     "programId": "690415d58971e73ca187d8c9",
 
-    "_comment": "邮箱配置二选一：IMAP 或 CloudMail",
+    "_comment": "邮箱配置四选一：IMAP、CloudMail、Mailpit 或 Webhook",
 
     "email_imap示例": {
         "type": "imap",
@@ -21,12 +21,22 @@
         "email_address": "receive@yourdomain.com"
     },
 
+    "email_mailpit示例_推荐用于本地测试": {
+        "type": "mailpit",
+        "api_url": "http://localhost:8025",
+        "email_address": "verify@test.com"
+    },
+
+    "email_webhook示例_推荐搭配Worker": {
+        "type": "webhook",
+        "api_url": "http://localhost:5000",
+        "email_address": "verify@yourdomain.com"
+    },
+
+    
     "email": {
-        "type": "imap",
-        "imap_server": "imap.gmail.com",
-        "imap_port": 993,
-        "email_address": "your_email@gmail.com",
-        "email_password": "your_app_password",
-        "use_ssl": true
-    }
+        "type": "mailpit",
+        "api_url": "http://localhost:8025",
+        "email_address": "verify@test.com"
+   }
 }

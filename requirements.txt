@@ -3,5 +3,11 @@
 # 基础依赖
 requests>=2.28.0
 
+# Web 服务器（用于接收 Worker 邮件）
+flask>=2.3.0
+
+# 浏览器自动化（模拟人类点击）
+selenium>=4.15.0
+
 # 可选：TLS 指纹模拟（推荐安装）
 requests-go>=1.0.0

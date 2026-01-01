@@ -1,0 +1,150 @@
+# ===========================
+# Python
+# ===========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyc
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ===========================
+# Virtual Environments
+# ===========================
+venv/
+env/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+
+# ===========================
+# 敏感配置文件（必须忽略）
+# ===========================
+config.json
+proxy.txt
+data.txt
+
+# ===========================
+# 运行生成的文件
+# ===========================
+used.txt
+result.txt
+*.log
+email_receiver.log
+
+# ===========================
+# Docker & 容器数据
+# ===========================
+mailpit-data/
+docker-compose.override.yml
+
+# ===========================
+# TLS 指纹文件（可选）
+# ===========================
+tls_json/*.json
+!tls_json/chrome_windows_example.json
+
+# ===========================
+# IDE & 编辑器
+# ===========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ===========================
+# 操作系统
+# ===========================
+Thumbs.db
+Desktop.ini
+.Spotlight-V100
+.Trashes
+
+# ===========================
+# 截图和临时文件
+# ===========================
+screenshot.png
+*.tmp
+*.bak
+*.old
+
+# ===========================
+# 测试覆盖率报告
+# ===========================
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# ===========================
+# Jupyter Notebook
+# ===========================
+.ipynb_checkpoints
+
+# ===========================
+# 环境变量文件
+# ===========================
+.env
+.env.local
+.env.*.local
+
+# ===========================
+# 数据库文件
+# ===========================
+*.db
+*.sqlite
+*.sqlite3
+*.swo
+*~
+.DS_Store
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 测试文件
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# 备份文件
+*.bak
+*.backup
+*.old
